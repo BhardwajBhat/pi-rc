@@ -1,16 +1,21 @@
 # pi rc
 
 Remote control for [pi](https://pi.dev): use `pi` in your terminal as usual, then
-follow and continue the same session from your phone or any browser.
+follow and continue the same session from your phone or any browser. From the
+same page you can start pi in any folder on any of your machines, and open a
+terminal on them.
 
 ```
-laptop: pi + rc extension ──┐
-desktop: pi + rc extension ─┼──► relay (free Cloudflare Worker) ◄── phone / browser
+laptop:  pi sessions + daemon ──┐
+desktop: pi sessions + daemon ──┼──► relay (free Cloudflare Worker) ◄── phone / browser
 ```
 
 - **extension/** — a pi extension. Each pi session connects out to the relay,
   streams what happens, and accepts messages typed on the web as if you typed
   them in the terminal. Works on any network that allows HTTPS (college wifi too).
+- **daemon/** — a small always-on service per machine (installed by `/rc setup`).
+  It lets the web page start pi in any folder (inside tmux) and open terminals,
+  even when no pi is running there.
 - **skills/publish-page/** — tells pi how to build pages (phone-first, pi rc's plain
   look, what works in the sandbox) and publish them; includes an HTML template.
 - **relay/** — a Cloudflare Worker + Durable Object that passes messages between
@@ -30,14 +35,19 @@ openssl rand -hex 24 | npx wrangler secret put TOKEN   # note this token
 
 ### 2. On each machine with pi
 ```sh
-pi install git:github.com/BhardwajBhat/pi-hub
+pi install git:github.com/BhardwajBhat/pi-rc
 ```
 Then inside pi, once:
 ```
 /rc setup https://pi-rc.<you>.workers.dev <token>
 ```
-It saves to `~/.pi/agent/pi-rc.json` and prints the web link
-(`https://…/#token=…`). Open that on your phone and add it to the home screen.
+It saves to `~/.pi/agent/pi-rc.json`, installs and starts the daemon as a login
+service (systemd user service on Linux, launchd agent on macOS), and prints the web
+link (`https://…/#token=…`). Open that on your phone and add it to the home screen.
+
+Needs Node 22+ (pi already does), and tmux for starting sessions from the web.
+Terminals work on Linux and macOS (not Windows yet). On Linux, run
+`loginctl enable-linger $USER` once if the daemon should run while you're logged out.
 
 ## Use
 - Start `pi` anywhere; the session shows up on the web page (footer: `rc ●`).
@@ -62,7 +72,34 @@ done with the migration".
   it steers it. The sender doesn't wait: a reply comes back later as a new message.
 - After 6 messages back and forth without you saying anything, sessions stop and
   ask you, so two agents can't loop forever.
-- Needs the relay redeployed once (`cd relay && npx wrangler deploy`).
+
+## Machines: new sessions and terminals
+Each machine with the daemon is listed under **Machines** on the web page.
+
+- **+ pi** opens a folder picker: recent pi folders first, then browse or type a
+  path, and **Start pi here**. pi starts in a new tmux session (`pi-<folder>-xxxx`)
+  with your normal setup, and the page opens it as soon as it connects. At the
+  machine, `tmux attach -t pi-<folder>-xxxx` gives you the same session in your terminal.
+- **>_** opens a shell on that machine. A session running in tmux has a **>_** button
+  too, which shows pi's own terminal UI. A key bar adds Esc, Tab, Ctrl, arrows.
+- **End** (sessions started from the web) quits that pi and closes its tmux session.
+- `/rc daemon` shows its status; `/rc daemon off` removes it, `/rc daemon on`
+  installs it again, `/rc daemon restart` restarts it.
+
+Terminals use [pi-env](https://www.npmjs.com/package/@earendil-works/pi-env)'s small
+PTY daemon (from pi's makers). The daemon downloads the pinned version (1.6.0) from
+npm the first time you open a terminal, checks it against npm's published sha512, and
+keeps it in `~/.pi/agent/pi-rc/`. (Installing the npm package normally would pull in
+~150 MB of model SDKs it doesn't need here.)
+
+## Updating
+```sh
+pi update --extensions               # on each machine: new extension + daemon code
+cd relay && npx wrangler deploy      # once, when the relay changed
+```
+Running pi sessions keep the old extension until restarted (or `/reload`). The daemon
+restarts itself onto the new version: the next pi session that starts notices the
+daemon is on an older version and restarts it.
 
 ## Pages (like artifacts)
 Ask pi for something to look at ("make a page comparing the runs", "publish the
@@ -79,8 +116,8 @@ plain style as pi rc, and calls its `publish_page` tool. You get a link like
   relay (Durable Object SQLite; the free plan allows 5 GB in total).
 
 ## Security
-Anyone with the token can send messages to your pi sessions, which can run
-commands on your machines. Keep the token private (it's in the web link).
+Anyone with the token can send messages to your pi sessions, start new ones and
+open terminals on every machine running the daemon. Keep the token private (it's in the web link).
 Rotate it with `npx wrangler secret put TOKEN` and `/rc setup` again.
 Traffic is HTTPS but not end-to-end encrypted: Cloudflare can see it.
 

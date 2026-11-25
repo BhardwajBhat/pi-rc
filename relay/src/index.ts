@@ -5,6 +5,8 @@
 //   GET /agent?token=...  WebSocket for a pi session (the extension)
 //   GET /viewer?token=... WebSocket for a browser
 //                         (sessions can also list and message each other over /agent)
+//   GET /host?token=...   WebSocket for a machine's pi rc daemon: starts pi in a folder,
+//                         lists folders, runs terminals; reachable even with no pi running
 //   POST /pages           publish or update a page   (Authorization: Bearer <token>)
 //   GET /pages            list published pages       (Authorization: Bearer <token>)
 //   DELETE /pages/<id>    remove a page              (Authorization: Bearer <token>)
@@ -23,8 +25,12 @@ interface Env {
   TOKEN: string;
 }
 
-type AgentInfo = { kind: "agent"; id: string; machine: string; cwd: string; name: string; busy: boolean; caps: string[] };
+type AgentInfo = {
+  kind: "agent"; id: string; machine: string; cwd: string; name: string; busy: boolean; caps: string[];
+  tmux: string; own: boolean; spawn: string; // tmux session it runs in; own = started from the web
+};
 type ViewerInfo = { kind: "viewer"; vid: string; open: string };
+type HostInfo = { kind: "host"; machine: string; platform: string; version: string; caps: string[]; tmux: boolean };
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -39,7 +45,7 @@ export default {
       return serveFile(await pages().file(served[1], served[2]));
     }
     const isPages = url.pathname === "/pages" || url.pathname.startsWith("/pages/");
-    if (!isPages && url.pathname !== "/agent" && url.pathname !== "/viewer") {
+    if (!isPages && url.pathname !== "/agent" && url.pathname !== "/viewer" && url.pathname !== "/host") {
       return new Response("not found", { status: 404 });
     }
     if (!env.TOKEN) return new Response("relay has no TOKEN secret set", { status: 500 });
@@ -205,14 +211,16 @@ export class Hub extends DurableObject<Env> {
   }
 
   async fetch(req: Request): Promise<Response> {
-    const kind = new URL(req.url).pathname === "/agent" ? "agent" : "viewer";
+    const path = new URL(req.url).pathname;
+    const kind = path === "/agent" ? "agent" : path === "/host" ? "host" : "viewer";
     const [client, server] = Object.values(new WebSocketPair());
     this.ctx.acceptWebSocket(server, [kind]);
     if (kind === "viewer") {
       server.serializeAttachment({ kind, vid: crypto.randomUUID(), open: "" } satisfies ViewerInfo);
       server.send(JSON.stringify({ type: "sessions", sessions: this.sessions() }));
+      server.send(JSON.stringify({ type: "hosts", hosts: this.hosts() }));
     } else {
-      server.serializeAttachment(null); // filled in by the agent's hello
+      server.serializeAttachment(null); // filled in by the hello
     }
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -222,9 +230,27 @@ export class Hub extends DurableObject<Env> {
     for (const ws of this.ctx.getWebSockets("agent")) {
       if (ws === gone) continue;
       const a = ws.deserializeAttachment() as AgentInfo | null;
-      if (a) out.push({ id: a.id, machine: a.machine, cwd: a.cwd, name: a.name, busy: a.busy, caps: a.caps ?? [] });
+      if (a) out.push({ id: a.id, machine: a.machine, cwd: a.cwd, name: a.name, busy: a.busy, caps: a.caps ?? [], tmux: a.tmux ?? "", own: !!a.own, spawn: a.spawn ?? "" });
     }
     return out;
+  }
+
+  hosts(gone?: WebSocket): Omit<HostInfo, "kind">[] {
+    const out = [];
+    for (const ws of this.ctx.getWebSockets("host")) {
+      if (ws === gone) continue;
+      const h = ws.deserializeAttachment() as HostInfo | null;
+      if (h) out.push({ machine: h.machine, platform: h.platform, version: h.version, caps: h.caps, tmux: h.tmux });
+    }
+    return out;
+  }
+
+  host(machine: string): WebSocket | undefined {
+    return this.ctx.getWebSockets("host").find((ws) => (ws.deserializeAttachment() as HostInfo | null)?.machine === machine);
+  }
+
+  viewer(vid: string): WebSocket | undefined {
+    return this.ctx.getWebSockets("viewer").find((ws) => (ws.deserializeAttachment() as ViewerInfo).vid === vid);
   }
 
   agent(id: string): WebSocket | undefined {
@@ -249,7 +275,30 @@ export class Hub extends DurableObject<Env> {
     } catch {
       return;
     }
-    const me = ws.deserializeAttachment() as AgentInfo | ViewerInfo | null;
+    const me = ws.deserializeAttachment() as AgentInfo | ViewerInfo | HostInfo | null;
+    const kind = this.ctx.getTags(ws)[0];
+
+    if (kind === "host") {
+      // ---- from a machine's daemon
+      if (m.type === "hello") {
+        const info: HostInfo = {
+          kind: "host", machine: String(m.machine ?? "?"), platform: String(m.platform ?? ""),
+          version: String(m.version ?? ""), tmux: !!m.tmux,
+          caps: Array.isArray(m.caps) ? m.caps.map(String).slice(0, 20) : [],
+        };
+        const old = this.host(info.machine);
+        if (old && old !== ws) old.close(4000, "replaced");
+        ws.serializeAttachment(info);
+        this.toViewers({ type: "hosts", hosts: this.hosts(old) });
+        return;
+      }
+      // Replies and terminal output go to the one browser they belong to.
+      if (me && typeof m.vid === "string" && (m.type === "res" || m.type === "term" || m.type === "term_exit")) {
+        const v = this.viewer(m.vid);
+        if (v) safeSend(v, JSON.stringify({ ...m, vid: undefined, machine: (me as HostInfo).machine }));
+      }
+      return;
+    }
 
     if (me === null || me.kind === "agent") {
       // ---- from a pi session
@@ -258,6 +307,7 @@ export class Hub extends DurableObject<Env> {
           kind: "agent", id: String(m.id), machine: String(m.machine ?? "?"),
           cwd: String(m.cwd ?? ""), name: String(m.name ?? ""), busy: !!m.busy,
           caps: Array.isArray(m.caps) ? m.caps.map(String).slice(0, 20) : [],
+          tmux: String(m.tmux ?? "").slice(0, 100), own: !!m.own, spawn: String(m.spawn ?? "").slice(0, 40),
         };
         // A reconnect replaces the old socket for the same session.
         this.agent(info.id)?.close(4000, "replaced");
@@ -303,12 +353,22 @@ export class Hub extends DurableObject<Env> {
     }
 
     // ---- from a browser
+    const vme = me as ViewerInfo;
+    if (m.type === "host_req" || m.type === "term_in" || m.type === "term_resize" || m.type === "term_close") {
+      const h = this.host(String(m.machine ?? ""));
+      if (!h) {
+        if (m.type === "host_req") safeSend(ws, JSON.stringify({ type: "res", req: m.req, machine: m.machine, error: "The pi rc daemon on that machine is offline." }));
+        return;
+      }
+      safeSend(h, JSON.stringify({ ...m, type: m.type === "host_req" ? "req" : m.type, machine: undefined, vid: vme.vid }));
+      return;
+    }
     if (m.type === "open") {
-      me.open = String(m.id ?? "");
-      ws.serializeAttachment(me);
-      const a = this.agent(me.open);
-      if (a) safeSend(a, JSON.stringify({ type: "snapshot_request", to: me.vid }));
-      else safeSend(ws, JSON.stringify({ type: "gone", id: me.open }));
+      vme.open = String(m.id ?? "");
+      ws.serializeAttachment(vme);
+      const a = this.agent(vme.open);
+      if (a) safeSend(a, JSON.stringify({ type: "snapshot_request", to: vme.vid }));
+      else safeSend(ws, JSON.stringify({ type: "gone", id: vme.open }));
     } else if (m.type === "prompt" || m.type === "abort") {
       const a = this.agent(String(m.id ?? ""));
       if (!a) return safeSend(ws, JSON.stringify({ type: "gone", id: m.id }));
@@ -328,8 +388,14 @@ export class Hub extends DurableObject<Env> {
     } catch {
       // already closed
     }
-    const me = ws.deserializeAttachment() as AgentInfo | ViewerInfo | null;
-    if (me?.kind === "agent") {
+    const me = ws.deserializeAttachment() as AgentInfo | ViewerInfo | HostInfo | null;
+    if (me?.kind === "host") {
+      this.toViewers({ type: "hosts", hosts: this.hosts(ws) });
+    } else if (me?.kind === "viewer") {
+      // Its terminals end with it.
+      const text = JSON.stringify({ type: "viewer_gone", vid: me.vid });
+      for (const h of this.ctx.getWebSockets("host")) safeSend(h, text);
+    } else if (me?.kind === "agent") {
       // Only announce if this was the session's live socket (not one replaced by a reconnect).
       if (!this.ctx.getWebSockets("agent").some((s) => s !== ws && (s.deserializeAttachment() as AgentInfo | null)?.id === me.id)) {
         this.toViewers({ type: "gone", id: me.id }, (v) => v.open === me.id);

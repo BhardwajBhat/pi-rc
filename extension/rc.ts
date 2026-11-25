@@ -5,8 +5,13 @@
 // Setup once per machine:   /rc setup https://pi-rc.<you>.workers.dev <token>
 // Then every pi session connects on its own. /rc shows status and the web link,
 // /rc off and /rc on toggle it for the current session.
+//
+// Setup also installs the pi rc daemon (daemon/pi-rc-daemon.mjs) as a login service,
+// so the web page can start pi in any folder on this machine and open terminals.
 import { getAgentDir, SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
@@ -14,6 +19,10 @@ import { basename, dirname, extname, join, relative, resolve } from "node:path";
 type Config = { url: string; token: string };
 
 const CONFIG_FILE = join(getAgentDir(), "pi-rc.json");
+const PKG_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const VERSION: string = (() => {
+  try { return JSON.parse(readFileSync(join(PKG_DIR, "package.json"), "utf8")).version; } catch { return "?"; }
+})();
 
 function loadConfig(): Config | null {
   const url = process.env.PI_RC_URL, token = process.env.PI_RC_TOKEN;
@@ -86,6 +95,106 @@ function collect(root: string): { path: string; type: string; data: string }[] {
   walk(root);
   if (!out.some((f) => f.path === "index.html")) throw new Error("The folder needs an index.html at its top level.");
   return out;
+}
+
+// ---- the daemon (a login service) ----------------------------------------
+
+const DAEMON_SCRIPT = join(PKG_DIR, "daemon", "pi-rc-daemon.mjs");
+const DAEMON_STATE = join(getAgentDir(), "pi-rc-daemon.json");
+const UNIT = join(homedir(), ".config", "systemd", "user", "pi-rc.service");
+const LABEL = "dev.pi-rc.daemon";
+const PLIST = join(homedir(), "Library", "LaunchAgents", LABEL + ".plist");
+const sh = (cmd: string, args: string[]) => execFileSync(cmd, args, { stdio: "pipe", timeout: 15000 }).toString();
+const uid = () => (process.getuid ? process.getuid() : 0);
+const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+function daemonInstalled(): boolean {
+  return process.platform === "darwin" ? existsSync(PLIST) : existsSync(UNIT);
+}
+
+function daemonState(): { pid: number; version: string } | null {
+  try {
+    const s = JSON.parse(readFileSync(DAEMON_STATE, "utf8"));
+    process.kill(s.pid, 0); // throws if it isn't running
+    return s;
+  } catch {
+    return null;
+  }
+}
+
+// Installs (or reinstalls) and starts the daemon. Returns what to tell the user.
+function daemonInstall(): string {
+  // The service gets this pi's PATH, so it finds node, pi and tmux like your shell does.
+  const node = process.execPath, path = process.env.PATH ?? "";
+  if (process.platform === "linux") {
+    mkdirSync(dirname(UNIT), { recursive: true });
+    writeFileSync(UNIT, [
+      "[Unit]", "Description=pi rc daemon (start pi and terminals from the web)", "After=network-online.target", "",
+      "[Service]", `ExecStart="${node}" "${DAEMON_SCRIPT}"`, "Restart=always", "RestartSec=5",
+      // tmux sessions it starts must outlive a daemon restart.
+      "KillMode=process", `Environment="PATH=${path}"`, "",
+      "[Install]", "WantedBy=default.target", "",
+    ].join("\n"));
+    sh("systemctl", ["--user", "daemon-reload"]);
+    sh("systemctl", ["--user", "enable", "pi-rc.service"]);
+    sh("systemctl", ["--user", "restart", "pi-rc.service"]);
+    return "Daemon running (systemd user service pi-rc). To keep it running while you're logged out: loginctl enable-linger $USER";
+  }
+  if (process.platform === "darwin") {
+    mkdirSync(dirname(PLIST), { recursive: true });
+    const logFile = join(getAgentDir(), "pi-rc-daemon.log");
+    writeFileSync(PLIST, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${LABEL}</string>
+  <key>ProgramArguments</key><array><string>${xml(node)}</string><string>${xml(DAEMON_SCRIPT)}</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(path)}</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardOutPath</key><string>${xml(logFile)}</string>
+  <key>StandardErrorPath</key><string>${xml(logFile)}</string>
+</dict></plist>
+`);
+    try { sh("launchctl", ["bootout", `gui/${uid()}/${LABEL}`]); } catch {}
+    sh("launchctl", ["bootstrap", `gui/${uid()}`, PLIST]);
+    return "Daemon running (launchd agent " + LABEL + ", log in " + tilde(logFile) + ").";
+  }
+  throw new Error(`No service setup for ${process.platform}. Run it yourself: node "${DAEMON_SCRIPT}"`);
+}
+
+function daemonRestart() {
+  if (process.platform === "darwin") sh("launchctl", ["kickstart", "-k", `gui/${uid()}/${LABEL}`]);
+  else sh("systemctl", ["--user", "restart", "pi-rc.service"]);
+}
+
+function daemonUninstall() {
+  if (process.platform === "darwin") {
+    try { sh("launchctl", ["bootout", `gui/${uid()}/${LABEL}`]); } catch {}
+    rmSync(PLIST, { force: true });
+  } else {
+    try { sh("systemctl", ["--user", "disable", "--now", "pi-rc.service"]); } catch {}
+    rmSync(UNIT, { force: true });
+    try { sh("systemctl", ["--user", "daemon-reload"]); } catch {}
+  }
+}
+
+function daemonStatus(): string {
+  if (!daemonInstalled()) return "Daemon: not installed (/rc daemon on to install).";
+  const s = daemonState();
+  if (!s) return "Daemon: installed but not running" + (process.platform === "darwin" ? " (see ~/.pi/agent/pi-rc-daemon.log)." : " (journalctl --user -u pi-rc).");
+  return `Daemon: running (pid ${s.pid}, version ${s.version}${s.version !== VERSION ? `; this pi has ${VERSION}, /rc daemon restart` : ""}).`;
+}
+
+// The tmux session this pi runs in, if any, so the web can open a terminal on it.
+function tmuxSession(): string {
+  if (process.env.PI_RC_TMUX) return process.env.PI_RC_TMUX;
+  if (!process.env.TMUX) return "";
+  try {
+    return execFileSync("tmux", ["display-message", "-p", "#S"], { stdio: "pipe", timeout: 1000 }).toString().trim();
+  } catch {
+    return "";
+  }
 }
 
 // ---- slash commands typed on the web --------------------------------------
@@ -312,7 +421,10 @@ export default function (pi: ExtensionAPI) {
         name: pi.getSessionName() ?? basename(ctx!.cwd),
         busy,
         // What this version of the extension can do, so the page can adapt.
-        caps: ["images"],
+        caps: ["images", "messages"],
+        tmux: tmuxSession(),
+        own: !!process.env.PI_RC_TMUX, // started from the web, in its own tmux session
+        spawn: process.env.PI_RC_SPAWN ?? "",
       });
       clearInterval(pingTimer);
       pingTimer = setInterval(() => sock.readyState === WebSocket.OPEN && sock.send("ping"), 30_000);
@@ -391,6 +503,11 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     connect();
+    // After pi updated this package, restart the daemon so it runs the same version.
+    if (daemonInstalled()) {
+      const d = daemonState();
+      if (d && d.version !== VERSION) try { daemonRestart(); } catch {}
+    }
   });
   pi.on("session_shutdown", async () => {
     disconnect();
@@ -584,7 +701,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("rc", {
-    description: "Remote control: /rc [setup <url> <token> | on | off | pages | unpublish <id>]",
+    description: "Remote control: /rc [setup <url> <token> | on | off | daemon [on|off|restart] | pages | unpublish <id>]",
     handler: async (args, c) => {
       ctx = c;
       const [cmd, url, token] = (args ?? "").trim().split(/\s+/);
@@ -610,7 +727,18 @@ export default function (pi: ExtensionAPI) {
         enabled = true;
         disconnect();
         connect();
-        c.ui.notify(`Saved to ${CONFIG_FILE}. Open on your phone:\n${webLink({ url, token })}`, "info");
+        let daemon: string;
+        try { daemon = daemonInstall(); } catch (e) { daemon = "Daemon not installed: " + (e as Error).message; }
+        c.ui.notify(`Saved to ${CONFIG_FILE}. Open on your phone:\n${webLink({ url, token })}\n${daemon}`, "info");
+      } else if (cmd === "daemon") {
+        try {
+          if (url === "on") c.ui.notify(daemonInstall(), "info");
+          else if (url === "off") { daemonUninstall(); c.ui.notify("Daemon stopped and removed. Sessions it started keep running in tmux.", "info"); }
+          else if (url === "restart") { daemonRestart(); c.ui.notify("Daemon restarted.", "info"); }
+          else c.ui.notify(daemonStatus() + "\nThe daemon lets the web page start pi in any folder here and open terminals.", "info");
+        } catch (e) {
+          c.ui.notify("rc daemon: " + (e as Error).message, "error");
+        }
       } else if (cmd === "pages" || cmd === "unpublish") {
         const config = loadConfig();
         if (!config) return c.ui.notify("Not set up. Run: /rc setup <relay url> <token>", "warning");
@@ -641,7 +769,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const state = !enabled ? "off" : ws?.readyState === WebSocket.OPEN ? "connected" : "connecting…";
-        c.ui.notify(`rc ${state}. Web: ${webLink(config)}`, "info");
+        c.ui.notify(`rc ${state}. Web: ${webLink(config)}\n${daemonStatus()}`, "info");
       }
     },
   });

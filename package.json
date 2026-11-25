@@ -1,6 +1,6 @@
 {
   "name": "pi-rc",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Remote control for pi: follow and continue your pi sessions from a phone or any browser.",
   "private": true,
   "keywords": [
