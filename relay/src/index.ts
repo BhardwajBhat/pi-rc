@@ -4,6 +4,7 @@
 //   GET /                 the web page
 //   GET /agent?token=...  WebSocket for a pi session (the extension)
 //   GET /viewer?token=... WebSocket for a browser
+//                         (sessions can also list and message each other over /agent)
 //   POST /pages           publish or update a page   (Authorization: Bearer <token>)
 //   GET /pages            list published pages       (Authorization: Bearer <token>)
 //   DELETE /pages/<id>    remove a page              (Authorization: Bearer <token>)
@@ -281,6 +282,22 @@ export class Hub extends DurableObject<Env> {
           this.listChanged();
         }
         this.toViewers({ type: "event", id: me.id, event: ev }, (v) => v.open === me.id);
+      } else if (m.type === "list") {
+        // Session to session: which other sessions are live.
+        safeSend(ws, JSON.stringify({ type: "reply", req: m.req, sessions: this.sessions().filter((s) => s.id !== me.id) }));
+      } else if (m.type === "send") {
+        // Session to session: deliver a message, labelled with who sent it (the relay
+        // knows the sender, so it can't be faked by the message text).
+        const reply = (r: object) => safeSend(ws, JSON.stringify({ type: "reply", req: m.req, ...r }));
+        const target = this.agent(String(m.to ?? ""));
+        if (!target || target === ws) return reply({ error: "That session is not online." });
+        const t = target.deserializeAttachment() as AgentInfo;
+        safeSend(target, JSON.stringify({
+          type: "prompt", text: String(m.text ?? "").slice(0, 100_000),
+          from: { id: me.id, name: me.name, machine: me.machine, cwd: me.cwd },
+          hops: Math.max(0, Math.floor(Number(m.hops) || 0)),
+        }));
+        reply({ ok: true, busy: t.busy, name: t.name });
       }
       return;
     }

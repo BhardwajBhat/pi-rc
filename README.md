@@ -51,6 +51,19 @@ It saves to `~/.pi/agent/pi-rc.json` and prints the web link
 - `/rc` shows status and the link · `/rc off` / `/rc on` for the current session.
 - A session is listed while its pi is running and online.
 
+## Sessions talking to each other
+Every pi session with rc can see and message the others, on any machine. Ask pi
+things like "ask the session in ~/api which endpoints changed" or "tell beta I'm
+done with the migration".
+
+- `list_sessions` shows the other running sessions (name, machine, folder, busy).
+- `send_to_session` sends one a message, by name or session id. It arrives like a
+  message from you, labelled with which session sent it; if that session is busy
+  it steers it. The sender doesn't wait: a reply comes back later as a new message.
+- After 6 messages back and forth without you saying anything, sessions stop and
+  ask you, so two agents can't loop forever.
+- Needs the relay redeployed once (`cd relay && npx wrangler deploy`).
+
 ## Pages (like artifacts)
 Ask pi for something to look at ("make a page comparing the runs", "publish the
 report") and it loads the bundled `publish-page` skill, writes HTML in the same
