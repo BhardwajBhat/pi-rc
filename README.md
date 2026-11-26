@@ -18,8 +18,11 @@ desktop: pi sessions + daemon ──┼──► relay (free Cloudflare Worker) 
   even when no pi is running there.
 - **skills/publish-page/** — tells pi how to build pages (phone-first, pi rc's plain
   look, what works in the sandbox) and publish them; includes an HTML template.
+- **skills/subagents/** — tells pi when and how to hand work to subagents (monitors
+  running `pi -p`): self-contained tasks, parallel work, avoiding clashing edits.
 - **relay/** — a Cloudflare Worker + Durable Object that passes messages between
-  pi sessions and browsers, and serves the web page. It stores nothing.
+  pi sessions and browsers, and serves the web page. It stores nothing except pages
+  you publish.
 
 ## Setup
 
