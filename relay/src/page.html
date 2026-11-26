@@ -104,7 +104,13 @@ aside b.sub { margin-top: 1.2rem; }
 .mon button { float: right; font-size: .75rem; padding: 0 .4rem; }
 .mon small { display: block; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mon pre { font-size: .72rem; max-height: 8rem; margin: .3rem 0 0; }
-@media (max-width: 1000px) { #mons { display: none; } }
+#mons > summary { font-weight: 600; color: inherit; list-style: none; cursor: default; }
+@media (max-width: 1000px) {
+  #body { flex-direction: column-reverse; }
+  #body > #log { flex: 1; }
+  #mons { width: auto; max-height: 45vh; border-left: 0; border-bottom: 1px solid var(--line); padding: .4rem .8rem; }
+  #mons > summary { cursor: pointer; list-style: revert; }
+}
 [hidden] { display: none !important; }
 @media (max-width: 640px) {
   .app { grid-template-columns: 1fr; }
@@ -138,7 +144,7 @@ aside b.sub { margin-top: 1.2rem; }
     </header>
     <div id="body">
       <section id="log"></section>
-      <div id="mons" hidden></div>
+      <details id="mons" hidden><summary></summary><div id="monlist"></div></details>
     </div>
     <section id="picker" class="pane" hidden>
       <div class="pathrow"><input id="path" placeholder="~/projects/app" autocapitalize="off" autocorrect="off" spellcheck="false"><button id="go" type="button">Open</button></div>
@@ -462,8 +468,15 @@ function select(id) {
 // ---- monitors: the open session's background commands, in a right column
 let monitors = [];
 function renderMonitors() {
-  $('mons').hidden = !monitors.length;
-  $('mons').replaceChildren(el('b', 'Monitors'), ...monitors.map(m => {
+  // A column on wide screens; on phones a bar above the chat that opens on tap.
+  const box = $('mons'), wide = matchMedia('(min-width: 1001px)').matches;
+  if (!monitors.length) box.hidden = true;
+  else if (box.hidden) { box.hidden = false; box.open = wide; }
+  if (wide) box.open = true;
+  const running = monitors.filter(m => m.status === 'running');
+  box.firstChild.textContent = 'Monitors \u00b7 ' + (running.length ? running.length + ' running' : 'none running') +
+    (box.open || !running.length ? '' : ': ' + running.map(m => m.name).join(', '));
+  $('monlist').replaceChildren(...monitors.map(m => {
     const card = el('div', null, 'mon'), b = el('button', m.status === 'running' ? 'Stop' : '\u00d7');
     b.type = 'button'; b.onclick = () => send({type: 'prompt', id: open, text: '/monitor stop ' + m.id});
     const state = m.status === 'exited' ? 'exit ' + m.code : m.status;
@@ -472,6 +485,8 @@ function renderMonitors() {
     return card;
   }));
 }
+
+$('mons').ontoggle = () => renderMonitors();
 
 function touch() { return matchMedia('(pointer: coarse)').matches; }
 function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
