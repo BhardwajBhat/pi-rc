@@ -60,6 +60,27 @@ Terminals work on Linux and macOS (not Windows yet). On Linux, run
   `/tree`, `/login`…) say so instead of going to the model.
 - `/rc` shows status and the link · `/rc off` / `/rc on` for the current session.
 - A session is listed while its pi is running and online.
+- On a laptop or desktop, **Notify when done** (under Machines) turns on a system
+  notification when any session finishes, only while the pi rc tab isn't focused.
+  Clicking it opens that session. Needs the tab open (it can be in the background).
+
+## Monitors (background commands, subagents)
+pi gets a `monitor` tool: it starts a shell command in the background, and new
+output lines (or only lines matching a regex) arrive in the session as messages that
+steer pi, so it sees them as soon as its current tool calls finish. It also hears when
+the command exits. Use it for dev servers, test watchers, log tails and long builds.
+
+A subagent is just a monitor running `pi -p --no-session "task"`: its answer arrives
+when it exits. Start several for parallel work. Each one is also a pi rc session, named
+`subagent-<folder>-<monitor name>` and listed under its parent on the web, so you can
+watch or steer it; it disappears when it exits. Subagents can't start monitors or
+subagents of their own.
+
+Sessions without a name (`/name`) are listed as `<folder>-<first words of the first message>`.
+
+Running monitors show above the editor in the terminal, and in a column on the right
+of the web page (wide screens), with Stop buttons. `/monitor` lists them,
+`/monitor stop <id|all>` stops them. They end with the session.
 
 ## Sessions talking to each other
 Every pi session with rc can see and message the others, on any machine. Ask pi

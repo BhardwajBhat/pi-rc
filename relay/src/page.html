@@ -14,6 +14,7 @@ aside { border-right: 1px solid var(--line); overflow: auto; padding: .6rem .5re
 aside b { display: block; margin: 0 .3rem .5rem; }
 aside a { display: block; padding: .35rem .3rem; color: inherit; text-decoration: none; border-radius: 4px; overflow-wrap: anywhere; }
 aside a[aria-current] { background: var(--code); font-weight: 600; }
+aside a.sub { margin-left: .8rem; font-size: .85rem; }
 aside small { display: block; color: var(--dim); font-weight: normal; }
 .empty { color: var(--dim); padding: .3rem; }
 main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -95,6 +96,15 @@ aside b.sub { margin-top: 1.2rem; }
 #keys { display: flex; gap: .3rem; padding: .3rem; overflow-x: auto; border-top: 1px solid var(--line); background: Canvas; }
 #keys button { flex: none; min-width: 2.4rem; padding: .35rem .5rem; font-size: .85rem; }
 #keys button[aria-pressed=true] { background: #168aa3; color: #fff; }
+#notify { margin: 1.2rem .3rem 0; font-size: .8rem; padding: .15rem .45rem; }
+#body { flex: 1; display: flex; min-height: 0; }
+#body > #log { min-width: 0; }
+#mons { flex: none; width: 16rem; border-left: 1px solid var(--line); overflow: auto; padding: .6rem; font-size: .85rem; }
+.mon { border-bottom: 1px solid var(--line); padding: .4rem 0; }
+.mon button { float: right; font-size: .75rem; padding: 0 .4rem; }
+.mon small { display: block; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mon pre { font-size: .72rem; max-height: 8rem; margin: .3rem 0 0; }
+@media (max-width: 1000px) { #mons { display: none; } }
 [hidden] { display: none !important; }
 @media (max-width: 640px) {
   .app { grid-template-columns: 1fr; }
@@ -117,6 +127,7 @@ aside b.sub { margin-top: 1.2rem; }
     <nav id="list"></nav>
     <b class="sub">Machines</b>
     <nav id="hosts"></nav>
+    <button id="notify" type="button" hidden></button>
   </aside>
   <main>
     <header>
@@ -125,7 +136,10 @@ aside b.sub { margin-top: 1.2rem; }
       <small id="where"></small>
       <span id="actions"></span>
     </header>
-    <section id="log"></section>
+    <div id="body">
+      <section id="log"></section>
+      <div id="mons" hidden></div>
+    </div>
     <section id="picker" class="pane" hidden>
       <div class="pathrow"><input id="path" placeholder="~/projects/app" autocapitalize="off" autocorrect="off" spellcheck="false"><button id="go" type="button">Open</button></div>
       <button id="start" type="button">Start pi here</button>
@@ -197,6 +211,54 @@ function linked(text, cls) {
   box.append(text.slice(last));
   return box;
 }
+// ---- desktop notifications: a session finished, and this tab isn't focused
+const canNotify = 'Notification' in window && !matchMedia('(pointer: coarse)').matches; // phones need Web Push
+const wasBusy = new Map(); // session id -> busy, to spot busy -> idle
+let notifyOn = false;
+try { notifyOn = localStorage.getItem('pi-rc-notify') === '1'; } catch (e) {}
+
+function renderNotify() {
+  const b = $('notify');
+  b.hidden = !canNotify;
+  if (!canNotify) return;
+  const on = notifyOn && Notification.permission === 'granted';
+  b.textContent = on ? '🔔 Notifications on' : Notification.permission === 'denied' ? '🔕 Blocked in browser' : '🔕 Notify when done';
+  b.title = on ? 'You get a notification when a session finishes while this tab is in the background. Click to turn off.'
+               : 'Get a notification when a session finishes while this tab is in the background';
+}
+$('notify').onclick = async () => {
+  if (notifyOn && Notification.permission === 'granted') notifyOn = false;
+  else notifyOn = (await Notification.requestPermission()) === 'granted';
+  try { localStorage.setItem('pi-rc-notify', notifyOn ? '1' : '0'); } catch (e) {}
+  renderNotify();
+};
+
+function checkFinished(list) {
+  for (const s of list) {
+    const before = wasBusy.get(s.id);
+    wasBusy.set(s.id, s.busy);
+    if (before && !s.busy) notifyDone(s);
+  }
+  for (const id of [...wasBusy.keys()]) if (!list.some(s => s.id === id)) wasBusy.delete(id);
+}
+
+function notifyDone(s) {
+  if (!canNotify || !notifyOn || Notification.permission !== 'granted') return;
+  if (!document.hidden && document.hasFocus()) return; // you're looking at it
+  const name = s.name || s.cwd.split('/').pop() || 'session';
+  let body = 'Finished · ' + s.machine + ':' + s.cwd;
+  if (s.id === open) {
+    // For the open session we have the reply: show its start.
+    const last = [...messages].reverse().find(m => m.role === 'assistant');
+    const text = last ? textOf(last.content).trim().replace(/\s+/g, ' ') : '';
+    if (text) body = text.length > 140 ? text.slice(0, 140) + '…' : text;
+  }
+  try {
+    const n = new Notification('pi · ' + name, {body, tag: 'pi-rc-' + s.id});
+    n.onclick = () => { window.focus(); if (sessions.some(x => x.id === s.id) && open !== s.id) select(s.id); n.close(); };
+  } catch (e) {}
+}
+
 function textOf(content) {
   if (typeof content === 'string') return content;
   return (content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
@@ -328,8 +390,13 @@ function renderList() {
   const list = $('list');
   list.replaceChildren();
   if (!sessions.length) list.append(el('div', 'No pi sessions connected.', 'empty'));
-  for (const s of sessions) {
+  // Subagents go right under the session that started them, indented.
+  const ids = new Set(sessions.map(s => s.id));
+  const top = sessions.filter(s => !ids.has(s.parent));
+  const ordered = top.flatMap(t => [t, ...sessions.filter(s => s.parent === t.id)]);
+  for (const s of ordered) {
     const a = el('a', (s.busy ? '● ' : '') + (s.name || s.cwd.split('/').pop() || 'session'));
+    if (ids.has(s.parent)) a.className = 'sub';
     a.href = '#';
     a.append(el('small', s.machine));
     if (s.id === open) a.setAttribute('aria-current', 'true');
@@ -377,7 +444,7 @@ function controls() {
 function show(v) {
   if (view === 'term' && v !== 'term') closeTerm();
   view = v;
-  $('log').hidden = $('chatfoot').hidden = v !== 'chat';
+  $('body').hidden = $('chatfoot').hidden = v !== 'chat';
   $('picker').hidden = v !== 'picker';
   $('termbox').hidden = v !== 'term';
   $('actions').replaceChildren();
@@ -386,10 +453,24 @@ function show(v) {
 
 function select(id) {
   show('chat');
-  open = id; messages = []; partial = null; activity = '';
+  open = id; messages = []; partial = null; activity = ''; monitors = []; renderMonitors();
   $('app').classList.add('chat');
   renderLog(); renderList();
   send({type: 'open', id});
+}
+
+// ---- monitors: the open session's background commands, in a right column
+let monitors = [];
+function renderMonitors() {
+  $('mons').hidden = !monitors.length;
+  $('mons').replaceChildren(el('b', 'Monitors'), ...monitors.map(m => {
+    const card = el('div', null, 'mon'), b = el('button', m.status === 'running' ? 'Stop' : '\u00d7');
+    b.type = 'button'; b.onclick = () => send({type: 'prompt', id: open, text: '/monitor stop ' + m.id});
+    const state = m.status === 'exited' ? 'exit ' + m.code : m.status;
+    card.append(b, el('div', (m.status === 'running' ? '\u25cf ' : '') + m.name), el('small', m.id + ' \u00b7 ' + state + ' \u00b7 $ ' + m.command));
+    if (m.lines.length) card.append(el('pre', m.lines.join('\n')));
+    return card;
+  }));
 }
 
 function touch() { return matchMedia('(pointer: coarse)').matches; }
@@ -403,6 +484,7 @@ function onEvent(ev) {
     messages.push(ev.message);
   } else if (ev.type === 'busy') { busy = ev.busy; if (!busy) { activity = ''; partial = null; } }
   else if (ev.type === 'activity') activity = ev.text || '';
+  else if (ev.type === 'monitors') { monitors = Array.isArray(ev.monitors) ? ev.monitors : []; renderMonitors(); return; }
   else if (ev.type === 'notice') messages.push({role: 'notice', text: String(ev.text || '')}); // shown here only, not saved
   else if (ev.type === 'choices') messages.push({role: 'choices', title: String(ev.title || ''), command: String(ev.command || ''), items: Array.isArray(ev.items) ? ev.items : []});
   renderLog(); controls();
@@ -427,7 +509,7 @@ function connect() {
       const gone = open && !m.sessions.some(s => s.id === open);
       const cur = sessions.find(s => s.id === open);
       if (gone && cur) follow = {machine: cur.machine, cwd: cur.cwd, until: Date.now() + 15000};
-      sessions = m.sessions; renderList();
+      sessions = m.sessions; renderList(); checkFinished(sessions);
       // A session started from the web: open it as soon as it connects.
       if (awaitSpawn) {
         const s = sessions.find(x => x.spawn === awaitSpawn.id);
@@ -440,7 +522,7 @@ function connect() {
       }
     }
     else if (m.id !== open) return;
-    else if (m.type === 'snapshot') { messages = m.data.messages || []; partial = m.data.partial || null; commands = m.data.commands || []; busy = !!m.data.busy; renderLog(); controls(); }
+    else if (m.type === 'snapshot') { messages = m.data.messages || []; partial = m.data.partial || null; commands = m.data.commands || []; busy = !!m.data.busy; monitors = m.data.monitors || []; renderMonitors(); renderLog(); controls(); }
     else if (m.type === 'event') onEvent(m.event);
     else if (m.type === 'gone') {
       const was = sessions.find(s => s.id === m.id);
@@ -459,6 +541,8 @@ function connect() {
     setTimeout(connect, retry); retry = Math.min(retry * 2, 15000);
   };
 }
+
+renderNotify();
 
 $('login').onsubmit = ev => {
   ev.preventDefault();

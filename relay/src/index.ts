@@ -28,6 +28,7 @@ interface Env {
 type AgentInfo = {
   kind: "agent"; id: string; machine: string; cwd: string; name: string; busy: boolean; caps: string[];
   tmux: string; own: boolean; spawn: string; // tmux session it runs in; own = started from the web
+  parent: string; // for a subagent: the session that started it
 };
 type ViewerInfo = { kind: "viewer"; vid: string; open: string };
 type HostInfo = { kind: "host"; machine: string; platform: string; version: string; caps: string[]; tmux: boolean };
@@ -230,7 +231,7 @@ export class Hub extends DurableObject<Env> {
     for (const ws of this.ctx.getWebSockets("agent")) {
       if (ws === gone) continue;
       const a = ws.deserializeAttachment() as AgentInfo | null;
-      if (a) out.push({ id: a.id, machine: a.machine, cwd: a.cwd, name: a.name, busy: a.busy, caps: a.caps ?? [], tmux: a.tmux ?? "", own: !!a.own, spawn: a.spawn ?? "" });
+      if (a) out.push({ id: a.id, machine: a.machine, cwd: a.cwd, name: a.name, busy: a.busy, caps: a.caps ?? [], tmux: a.tmux ?? "", own: !!a.own, spawn: a.spawn ?? "", parent: a.parent ?? "" });
     }
     return out;
   }
@@ -308,6 +309,7 @@ export class Hub extends DurableObject<Env> {
           cwd: String(m.cwd ?? ""), name: String(m.name ?? ""), busy: !!m.busy,
           caps: Array.isArray(m.caps) ? m.caps.map(String).slice(0, 20) : [],
           tmux: String(m.tmux ?? "").slice(0, 100), own: !!m.own, spawn: String(m.spawn ?? "").slice(0, 40),
+          parent: String(m.parent ?? "").slice(0, 100),
         };
         // A reconnect replaces the old socket for the same session.
         this.agent(info.id)?.close(4000, "replaced");

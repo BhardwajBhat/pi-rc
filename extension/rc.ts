@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
+import { createMonitors } from "./monitors.ts";
 
 type Config = { url: string; token: string };
 
@@ -250,6 +251,20 @@ export default function (pi: ExtensionAPI) {
 
   const status = (text: string | undefined) => ctx?.hasUI && ctx.ui.setStatus("rc", text);
 
+  // Background monitors: sent to the web page (right column), at most every 300 ms,
+  // and listed in a one-line-each widget in the terminal.
+  let monitorTimer: ReturnType<typeof setTimeout> | undefined;
+  const monitors = createMonitors(pi, () => {
+    monitorTimer ??= setTimeout(() => {
+      monitorTimer = undefined;
+      const list = monitors.list();
+      event({ type: "monitors", monitors: list });
+      const running = list.filter((m) => m.status === "running");
+      if (ctx?.hasUI) ctx.ui.setWidget("monitors", running.length
+        ? running.map((m) => `◉ ${m.id} ${m.name} · ${m.lines.at(-1) ?? ""}`.slice(0, 120)) : undefined);
+    }, 300);
+  });
+
   function send(msg: unknown) {
     if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   }
@@ -418,10 +433,11 @@ export default function (pi: ExtensionAPI) {
         id: ctx!.sessionManager.getSessionId(),
         machine: hostname(),
         cwd: tilde(ctx!.cwd),
-        name: pi.getSessionName() ?? basename(ctx!.cwd),
+        name: displayName(),
+        parent: process.env.PI_RC_PARENT ?? "",
         busy,
         // What this version of the extension can do, so the page can adapt.
-        caps: ["images", "messages"],
+        caps: ["images", "messages", "monitors"],
         tmux: tmuxSession(),
         own: !!process.env.PI_RC_TMUX, // started from the web, in its own tmux session
         spawn: process.env.PI_RC_SPAWN ?? "",
@@ -452,7 +468,7 @@ export default function (pi: ExtensionAPI) {
         if (ctx && !ctx.isIdle()) pi.sendUserMessage(content, { deliverAs: "steer" });
         else pi.sendUserMessage(content);
       } else if (m.type === "snapshot_request") {
-        send({ type: "snapshot", to: m.to, data: { messages: history(), partial, busy, commands: commandList() } });
+        send({ type: "snapshot", to: m.to, data: { messages: history(), partial, busy, commands: commandList(), monitors: monitors.list() } });
       } else if (m.type === "prompt") {
         const text = typeof m.text === "string" ? m.text.trim() : "";
         const images = (Array.isArray(m.images) ? m.images : [])
@@ -498,6 +514,7 @@ export default function (pi: ExtensionAPI) {
     ctx = c;
     busy = false;
     partial = null;
+    slug = firstMessageSlug(); // "" for a new session; set by its first prompt
     if (!loadConfig()) {
       status("rc: run /rc setup");
       return;
@@ -510,6 +527,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
   pi.on("session_shutdown", async () => {
+    clearTimeout(monitorTimer);
     disconnect();
     ctx = null;
   });
@@ -517,7 +535,27 @@ export default function (pi: ExtensionAPI) {
     if (e.source === "interactive") hops = 0; // the user typed in the terminal
     return { action: "continue" };
   });
-  pi.on("session_info_changed", async (e: any) => event({ type: "name", name: e.name ?? "" }));
+  // The name shown on the web: the session name if set, else folder + a slug of the
+  // first message (subagents: "subagent-folder-<monitor name>"). Not saved to the session.
+  let slug = "";
+  const words = (t: string, n: number) =>
+    t.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(" ").filter(Boolean).slice(0, n).join("-").slice(0, 32);
+  function displayName() {
+    const folder = basename(ctx?.cwd ?? "") || "pi";
+    if (process.env.PI_RC_PARENT) return `subagent-${folder}-${words(process.env.PI_RC_SUBAGENT ?? "", 4) || "task"}`;
+    return pi.getSessionName() || `${folder}-${slug || (ctx?.sessionManager.getSessionId() ?? "").slice(-4)}`;
+  }
+  function firstMessageSlug() {
+    const first: any = ctx?.sessionManager.getBranch().find((e: any) => e.type === "message" && e.message.role === "user");
+    const c = first?.message.content;
+    return words(typeof c === "string" ? c : (c ?? []).map((b: any) => b.text ?? "").join(" "), 4);
+  }
+  pi.on("session_info_changed", async () => event({ type: "name", name: displayName() }));
+  pi.on("before_agent_start", async (e: any) => {
+    if (slug || !e.prompt) return;
+    slug = words(e.prompt, 4);
+    event({ type: "name", name: displayName() });
+  });
 
   pi.on("agent_start", async () => {
     busy = true;
