@@ -42,9 +42,10 @@ export function createMonitors(pi: ExtensionAPI, onChange: () => void) {
   }
 
   function onLine(m: Monitor, raw: string) {
-    const line = raw.replace(/\x1b\[[0-9;?]*[A-Za-z]|\r/g, "").slice(0, 400);
+    // Long cap: a subagent's answer often has whole paragraphs or long links on one line.
+    const line = raw.replace(/\x1b\[[0-9;?]*[A-Za-z]|\r/g, "").slice(0, 4000);
     if (!line.trim() || m.status !== "running") return;
-    m.lines = [...m.lines, line].slice(-KEEP);
+    m.lines = [...m.lines, line.slice(0, 300)].slice(-KEEP); // for the UI
     if (!m.match || new RegExp(m.match).test(line)) {
       m.queue.push(line);
       m.timer ??= setTimeout(() => flush(m), 1000);
